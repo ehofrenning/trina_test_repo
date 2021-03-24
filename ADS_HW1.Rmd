@@ -19,6 +19,8 @@ library(glmnet)
 library(ggplot2)
 library(dials)
 library(tidymodels)
+library(caret)
+library(e1071)
 library(naniar)
 library(vip) 
 hotels <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-02-11/hotels.csv')
@@ -171,7 +173,7 @@ hotels_lasso <-
 *Create a workflow with the recipe and model.*
 
 ```{r}
-# make recipe
+# make recipe: This is not relevant code
 #lasso_rec <-
 #  recipe(is_canceled ~ .,data = hotels_recipe) %>% 
 #  step_normalize(all_numeric())
@@ -206,6 +208,7 @@ hotels_cv <- vfold_cv(hotels_training, v = 5)
 penalty_grid <- grid_regular(penalty(), levels = 10)
 ```
 
+
 *Use the tune_grid() function to fit the models with different tuning parameters to the different cross-validation sets.*
 
 ```{r}
@@ -215,10 +218,11 @@ hotels_lasso_tune <-
 hotels_lasso_tune
 ```
 
+
 *Use the collect_metrics() function to collect all the metrics from the previous step and create a plot with the accuracy on the y-axis and the penalty term on the x-axis. Put the x-axis on the log scale.*
 
 ```{r}
-# This chunk just helps me understand how the collect_metrics fnt is working
+# This code just helped me understand how the collect_metrics fnt is working
 hotels_lasso_tune %>%
   collect_metrics() %>%
   filter(.metric == "accuracy") %>%  # we chose accuracy as the metric instead of rmse
@@ -237,7 +241,8 @@ hotels_lasso_tune %>%
                  labels = scales::trans_format("log10",scales::math_format(10^.x))) +   labs(x = "penalty", y = "accuracy")
 ```
 
-Use the select_best() function to find the best tuning parameter, fit the model using that tuning parameter to the entire training set (HINT: finalize_workflow() and fit()), and display the model results using pull_workflow_fit() and tidy(). Are there some variables with coefficients of 0?
+
+*Use the select_best() function to find the best tuning parameter, fit the model using that tuning parameter to the entire training set (HINT: finalize_workflow() and fit()), and display the model results using pull_workflow_fit() and tidy(). Are there some variables with coefficients of 0?*
 
 ```{r}
 # choose "best" tuning parameter -- ie. the value of lambda that maximizes accuracy
@@ -245,8 +250,26 @@ best_param <-
 hotels_lasso_tune %>% 
   select_best("accuracy")
 best_param
+
+# put the best tuning parameter into a final workflow
+hotels_lasso_final_wf <- lasso_wf %>% 
+  finalize_workflow(best_param)
+hotels_lasso_final_wf
 ```
 
+
+```{r}
+# fit the final model (with best lambda) to the training data
+hotels_lasso_final_mod <- hotels_lasso_final_wf %>% 
+  fit(data = hotels_training)
+
+# now, let's look at the model and see what coefficients shrunk to 0! 
+hotels_lasso_final_mod %>% 
+  pull_workflow_fit() %>% 
+  tidy() 
+```
+
+Around 5 coefficients shrunk to 0! I chose the "best" lambda, not the simplist within 1 SE of the best because I'm not concerned about simplicity right now-- if I had chosen the oneSE specification, there would've been more coefficients that shrunk to 0.
 
 
 \
@@ -257,8 +280,62 @@ best_param
 In this step, we’ll tune the model and fit the model using the best tuning parameter to the entire training dataset.
 
 
+*Create a variable importance graph. Which variables show up as the most important? Are you surprised?*
+
+```{r}
+hotels_lasso_final_mod %>% 
+  pull_workflow_fit() %>% 
+  vip()
+```
+
+Reserved room type, assigned room type, previous cancellations and deposit_type are all important predictors. Most of these make sense for obvious reasons-- for example, it makes sense that non-refundable deposits would be a good predictor of cancellation (if I made a non-refundable deposit, I'd definitely follow through with going). I'm a bit surprised that the country variable is so high!
 
 
+*Use the last_fit() function to fit the final model and then apply it to the testing data. Report the metrics from the testing data using the collet_metrics() function. How do they compare to the cross-validated metrics?*
+
+```{r}
+# Fit model with best tuning parameter(s) to training data and apply to test data
+hotels_lasso_test <- hotels_lasso_final_wf %>% 
+  last_fit(hotels_split)
+
+hotels_lasso_test %>%
+  collect_metrics()
+```
+
+Accuracy: 0.8154055
+ROC AUC: 0.8945097
+They compare well to the cross-validated metrics.
+
+
+*Use the collect_predictions() function to find the predicted probabilities and classes for the test data. Then, create a confusion matrix showing the predicted classes vs. the true classes. What is the true positive rate (sensitivity)? What is the true negative rate (specificity)?*
+
+```{r}
+# collect predictions
+preds <-
+collect_predictions(hotels_lasso_test)
+
+# create confusion matrix
+cm <- confusionMatrix(data = preds$.pred_class, reference = preds$is_canceled)
+cm
+```
+
+The true positive rate (sensitivity) is around .91 and the true negative rate (specificity) is around .65. 
+
+
+*Use the preds dataset you just created to create a density plot of the predicted probabilities of canceling (the variable is called .pred_1), filling by is_canceled. Use an alpha = .5 and color = NA in the geom_density(). Answer these questions: a. What would this graph look like for a model with an accuracy that was close to 1? b. Our predictions are classified as canceled if their predicted probability of canceling is greater than .5. If we wanted to have a high true positive rate, should we make the cutoff for predicted as canceled higher or lower than .5? c. What happens to the true negative rate if we try to get a higher true positive rate?*
+
+```{r}
+# create graph of predicted probabilities of canceling
+collect_predictions(hotels_lasso_test) %>% 
+  ggplot(aes(x = .pred_1, 
+             fill = is_canceled)) +
+  geom_density(alpha = .5, color = NA) +
+  labs(x = "Predicted Probabilities of Canceling", y = "density", fill = "Canceled", title = "Density of Predicted Probabilities of Canceling")
+```
+
+a. There would be no overlap across the .50 mark between the 0/1 groups.
+b. To get a higher true positive rate, we'd want increase the threshold past .5. 
+c. If we did the step from (b), this means that our true negative rate would decrease.
 
 \
 
@@ -267,8 +344,7 @@ In this step, we’ll tune the model and fit the model using the best tuning par
 
 *Let’s say that this model is going to be applied to bookings 14 days in advance of their arrival at each hotel, and someone who works for the hotel will make a phone call to the person who made the booking. During this phone call, they will try to assure that the person will be keeping their reservation or that they will be canceling in which case they can do that now and still have time to fill the room. How should the hotel go about deciding who to call? How could they measure whether it was worth the effort to do the calling? Can you think of another way they might use the model?*
 
-
-
+The hotel could use the model's predictions to determine who to call- if the model predicts cancellation, the hotel could call but if it doesn't then they shouldn't bother. In order to measure if it was worth the effort to do the calling, they could compare who actually ended up canceling against who the hotel called. Also, I feel like it'd be more efficient just to send automated emails asking for some sort of additional confirmation instead of calling. I'm not sure if this actually happens in the real world, but I feel like they might use the model in order to overbook rooms or something-- similar to how airplane companies do-- so, like, if there's a lot of predicted cancellations, the hotel might try to get a few extra reservations just in case (I think this is quite questionable, but I could see it happening).
 
 
 
@@ -276,17 +352,22 @@ In this step, we’ll tune the model and fit the model using the best tuning par
 
 ## 9
 
-Bias and fairness
+*How might you go about questioning and evaluating the model in terms of fairness? Are there any questions you would like to ask of the people who collected the data?*
 
-
+As I mentioned at the beginning, this data only followed two hotels and it did not come straight from hotels. Perhaps the hotels in the data are not representative of the entire hotel business because (1) there's only two and (2) they're both in one country, Portugal. Because of this, I question the generalizability of the model to other situations. I would ask the people who created the dataset if there are patterns in what data was not given, and if it was hard to obtain data from other hotels.
 
 
 \
 
 ## Bias and Fairness
 
-Listen to Dr. Rachel Thomas’s Bias and Fairness lecture. Write a brief paragraph reflecting on it. You might also be interested in reading the ProPublica article Dr. Thomas references about using a tool called COMPAS to predict recidivism. Some questions/ideas you might keep in mind:
+*Listen to Dr. Rachel Thomas’s Bias and Fairness lecture. Write a brief paragraph reflecting on it. You might also be interested in reading the ProPublica article Dr. Thomas references about using a tool called COMPAS to predict recidivism. Some questions/ideas you might keep in mind:*
 
-Did you hear anything that surprised you?
-Why is it important that we pay attention to bias and fairness when studying data science?
-Is there a type of bias Dr. Thomas discussed that was new to you? Can you think about places you have seen these types of biases?
+*Did you hear anything that surprised you?*
+*Why is it important that we pay attention to bias and fairness when studying data science?*
+*Is there a type of bias Dr. Thomas discussed that was new to you? Can you think about places you have seen these types of biases?*
+
+The statistic about how the algorithm predicting recidivism had an almost 45% false positive rate for Black defendants, compared to a 28% false positive rate for white defendants was really chilling. That's a super substantial difference, and something that is very indicative of why bias is very important to pay attention to in data science. This is an example of historical bias, which means that it is a fundamental, structural issue that exists within the data selection process--even if your model is perfect after. Another type of bias is aggregation bias because maybe one model is not great depending on what group you're looking at. A couple weeks ago I was researching a company I was interviewing for called Watson Health and there was a lot of articles about a very public instance of aggregation bias in their algorithms. I learned that they had a major deal doing the AI for cancer diagnoses--but they failed to use smaller hospitals and clinic data to train their models. So, their models were fit fine to their large hospital data, but failed when the tool was public because the small clinics and hospitals are fundamentally different. 
+
+
+
