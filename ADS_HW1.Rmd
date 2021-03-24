@@ -1,0 +1,292 @@
+---
+title: 'Homework 1'
+author: Trina Hofrenning
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(glmnet)
+library(ggplot2)
+library(dials)
+library(tidymodels)
+library(naniar)
+library(vip) 
+hotels <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-02-11/hotels.csv')
+```
+
+```{r}
+theme_set(theme_minimal())
+```
+
+
+**Setting up Git and GitHub in RStudio**
+
+https://github.com/ehofrenning?tab=repositories
+
+
+**Creating a website**
+
+https://trinahofrenning.netlify.app/
+
+In listening to the "Building a Portfolio" podcast, I learned about how a portfolio can be really helpful for getting first-jobs because it shows employers what you can do-- because I am still looking for a job, this honestly was really good to hear. They also talked about how building a portfolio is good because it, in and of itself, is teaching me new skills. I wouldn't know how to build an R website if I hadn't started to make one in this course-- maybe I will use this website-building knowledge down the line.
+
+## 1
+
+*What are some variables you think might be predictive of is_canceled and why?*
+
+A few predictors that stick out to me are: total_of_special_requests, previous_cancellations, and babies. I feel like if someone is making a lot of special requests they might be more picky and also prone to cancellation. If someone has made a lot of prior cancellations, they might be more likely to make a cancellation now. As for babies, I think that children add complexity into all life decisions and so parents may be more likely to cancel than non-parents. 
+
+*What are some problems that might exist with the data? You might think about how it was collected and who did the collecting.*
+
+Some problems include that the dataset only used two hotels. In addition, the data came from an open hotel demand dataset (not from the hotels themselves) and some of the data is private.
+
+
+*If we construct a model, what type of conclusions will be able to draw from it?*
+
+We can conclude what the best predictors of cancellation are and also can get estimates of the probability of cancellation.
+
+
+\
+
+## 2
+
+**Explore the data**
+
+I explored how children, lead time, and customer type are related to cancellation status. I also looked at a simple distribution of "special requests" just because I was curious about what that means and how many requests people actually make. Then I looked at how the amount of adults is related to the number of stays-- it looks like large parties do not stay for a long time, but some individuals do stay for long periods of time, which makes sense to me.
+
+```{r}
+hotels %>%
+  mutate(children2 = children > 0) %>%
+  na.omit(children2) %>%
+  ggplot(aes(x = children2, fill = as.factor(is_canceled))) +
+  geom_bar() +
+  labs(title = "Children and Cancellation", fill = "Canceled") +
+  xlab("Children")
+
+ggplot(hotels, aes(x = customer_type)) +
+  geom_bar() +
+  facet_wrap(~is_canceled) +
+  labs(title = "Customer Type by Cancellation Status") +
+  xlab("Customer Type")
+
+ggplot(hotels, aes(x = lead_time, col = as.factor(is_canceled))) +
+  geom_boxplot() +
+  labs(title = "Lead Time and Cancellation Status") +
+  xlab("Lead Time") +
+  labs(col = "Canceled")  #i like this one
+
+ggplot(hotels, aes(x = total_of_special_requests)) + 
+  geom_bar() +
+  labs("Distribution of Special Requests")
+
+ggplot(hotels, aes(x = stays_in_week_nights, y = adults)) +
+  geom_jitter(alpha = .3) +
+  labs(title = "Number of Stays and Adults") +
+  xlab("Week night stays") +
+  ylab("Adults")
+```
+
+
+
+\
+
+## 3
+
+**Readying the data and split into training and testing sets:**
+
+```{r}
+hotels_mod <- hotels %>% 
+  mutate(is_canceled = as.factor(is_canceled)) %>% 
+  mutate(across(where(is.character), as.factor)) %>% 
+  select(-arrival_date_year,
+         -reservation_status,
+         -reservation_status_date) %>% 
+  add_n_miss() %>% 
+  filter(n_miss_all == 0) %>% 
+  select(-n_miss_all)
+
+# set seed for reproducibility
+set.seed(494)
+
+# split the data
+hotels_split <- initial_split(hotels_mod, prop = .5, strata = is_canceled)
+
+# make training/test sets
+hotels_training <- training(hotels_split)
+hotels_testing <- testing(hotels_split)
+```
+
+\
+
+## 4
+
+**Pre-Processing the data:**
+
+```{r}
+# pre-processing:
+hotels_recipe <- recipe(is_canceled ~ ., data = hotels_training) %>%
+  step_mutate_at(children, babies, previous_cancellations, fn = ~as.factor(. > 0)) %>%
+  step_mutate_at(agent, company, fn = ~as.factor(. == "NULL")) %>%
+  step_mutate(country = fct_lump_n(country, 5)) %>%
+  step_normalize(all_numeric()) %>%    # we could exclude the outcome variable
+  step_dummy(all_nominal(), -all_outcomes())
+
+# check to see if it looks good:
+prep(hotels_recipe) %>%
+  juice() %>%
+  head()
+```
+\
+
+## 5
+
+**LASSO model and workflow**
+
+*Why would we want to use LASSO instead of regular logistic regression?*
+LASSO models shrink coefficients such that some predictors will be kicked out of the model if they aren't super strong predictors of the outcome-- this means that the model's variance will be reduced and will be less overfit than a regular logistic regression because it doesn't have a shrinkage component. LASSO is also great because it is a helpful method to select predictors if we want to use a more complex model down the line.
+
+
+*Define the model type, set the engine, set the penalty argument to tune() as a placeholder, and set the mode.*
+
+```{r}
+# define a LASSO model
+hotels_lasso <- 
+  logistic_reg(mixture = 1) %>%   # 1 indicates lasso
+  set_engine("glmnet") %>%
+  set_args(penalty = tune()) %>%   #we'll tune the lambda later
+  set_mode("classification")  #hanged from regression to classification!!!!!!!
+```
+
+
+*Create a workflow with the recipe and model.*
+
+```{r}
+# make recipe
+#lasso_rec <-
+#  recipe(is_canceled ~ .,data = hotels_recipe) %>% 
+#  step_normalize(all_numeric())
+
+# define LASSO workflow
+lasso_wf <-
+  workflow() %>%
+  add_recipe(hotels_recipe) %>%   #the processed data
+  add_model(hotels_lasso)     #the general lasso model
+lasso_wf
+```
+
+
+
+\ 
+
+## 6
+
+In this step, we’ll tune the model and fit the model using the best tuning parameter to the entire training dataset.
+
+
+*Create a 5-fold cross-validation sample. We’ll use this later. I have set the seed for you.*
+
+```{r}
+hotels_cv <- vfold_cv(hotels_training, v = 5)
+```
+
+
+*Use the grid_regular() function to create a grid of 10 potential penalty parameters (we’re keeping this sort of small because the dataset is pretty large). Use that with the 5-fold cv data to tune the model.*
+
+```{r}
+penalty_grid <- grid_regular(penalty(), levels = 10)
+```
+
+*Use the tune_grid() function to fit the models with different tuning parameters to the different cross-validation sets.*
+
+```{r}
+hotels_lasso_tune <- 
+  lasso_wf %>%
+  tune_grid(resamples = hotels_cv, grid = penalty_grid)
+hotels_lasso_tune
+```
+
+*Use the collect_metrics() function to collect all the metrics from the previous step and create a plot with the accuracy on the y-axis and the penalty term on the x-axis. Put the x-axis on the log scale.*
+
+```{r}
+# This chunk just helps me understand how the collect_metrics fnt is working
+hotels_lasso_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%  # we chose accuracy as the metric instead of rmse
+  head()
+```
+
+```{r}
+# create plot of Accuracy and the penalty term lambda
+hotels_lasso_tune %>% 
+  collect_metrics() %>% 
+  filter(.metric == "accuracy") %>% 
+  ggplot(aes(x = penalty, y = mean)) +
+  geom_point() +
+  geom_line() +
+  scale_x_log10( breaks = scales::trans_breaks("log10", function(x) 10^x),
+                 labels = scales::trans_format("log10",scales::math_format(10^.x))) +   labs(x = "penalty", y = "accuracy")
+```
+
+Use the select_best() function to find the best tuning parameter, fit the model using that tuning parameter to the entire training set (HINT: finalize_workflow() and fit()), and display the model results using pull_workflow_fit() and tidy(). Are there some variables with coefficients of 0?
+
+```{r}
+# choose "best" tuning parameter -- ie. the value of lambda that maximizes accuracy
+best_param <-
+hotels_lasso_tune %>% 
+  select_best("accuracy")
+best_param
+```
+
+
+
+\
+
+
+## 7
+
+In this step, we’ll tune the model and fit the model using the best tuning parameter to the entire training dataset.
+
+
+
+
+
+\
+
+
+## 8
+
+*Let’s say that this model is going to be applied to bookings 14 days in advance of their arrival at each hotel, and someone who works for the hotel will make a phone call to the person who made the booking. During this phone call, they will try to assure that the person will be keeping their reservation or that they will be canceling in which case they can do that now and still have time to fill the room. How should the hotel go about deciding who to call? How could they measure whether it was worth the effort to do the calling? Can you think of another way they might use the model?*
+
+
+
+
+
+
+\
+
+## 9
+
+Bias and fairness
+
+
+
+
+\
+
+## Bias and Fairness
+
+Listen to Dr. Rachel Thomas’s Bias and Fairness lecture. Write a brief paragraph reflecting on it. You might also be interested in reading the ProPublica article Dr. Thomas references about using a tool called COMPAS to predict recidivism. Some questions/ideas you might keep in mind:
+
+Did you hear anything that surprised you?
+Why is it important that we pay attention to bias and fairness when studying data science?
+Is there a type of bias Dr. Thomas discussed that was new to you? Can you think about places you have seen these types of biases?
